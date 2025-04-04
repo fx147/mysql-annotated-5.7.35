@@ -1632,6 +1632,7 @@ void THD::init_for_queries(Relay_log_info *rli)
 
 void THD::set_new_thread_id()
 {
+  /** 通过全局THD管理器的方法分配线程id */
   m_thread_id= Global_THD_manager::get_instance()->get_new_thread_id();
   variables.pseudo_thread_id= m_thread_id;
   thr_lock_info_init(&lock_info, m_thread_id, &COND_thr_lock);

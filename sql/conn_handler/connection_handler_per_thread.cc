@@ -257,15 +257,28 @@ static THD* init_new_thd(Channel_info *channel_info)
   - End thread  / Handle next connection using thread from thread cache
 */
 
+/**
+ * 这里为什么需要extern "C"
+ * 线程入口函数通常由底层线程库调用，所以需要声明为extern "C"
+ */
 extern "C" void *handle_connection(void *arg)
 {
   // 全局THD管理器
   Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
+  /**
+   * 这里为什么要获取管理器和channel_info的信息？
+   * 虽然连接处理器是连接管理器的成员类，但是目前这个函数并不是连接处理器的成员方法
+   */
   Connection_handler_manager *handler_manager=
     Connection_handler_manager::get_instance();
   Channel_info* channel_info= static_cast<Channel_info*>(arg);
+  /** 定义了线程复用的标志位*/
   bool pthread_reused MY_ATTRIBUTE((unused))= false;
 
+  /** 
+   * 初始化线程，分配相关资源和设置必要的全局变量，
+   * 这里初始化失败会返回非零值进行函数内的操作 
+   */
   if (my_thread_init())
   {
     connection_errors_internal++;
@@ -290,7 +303,10 @@ extern "C" void *handle_connection(void *arg)
       break; // We are out of resources, no sense in continuing.
     }
 
-    // 重用连接线程
+    /**
+     * 检查当前线程是否是复用线程，
+     * 如果是复用的线程，则需要重新设置性能监控相关的上下文信息
+     */
 #ifdef HAVE_PSI_THREAD_INTERFACE
     if (pthread_reused)
     {

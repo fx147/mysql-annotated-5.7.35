@@ -38,14 +38,16 @@
   callback functor object would on receiving connection event
   from the client to process the connection.
 */
-template <typename Listener> class Connection_acceptor
+template <typename Listener>
+class Connection_acceptor
 {
   Listener *m_listener;
 
 public:
   Connection_acceptor(Listener *listener)
-  : m_listener(listener)
-  { }
+      : m_listener(listener)
+  {
+  }
 
   ~Connection_acceptor()
   {
@@ -68,11 +70,11 @@ public:
   /* 循环阻塞监听连接请求，直到收到中止循环的信号 */
   void connection_event_loop()
   {
-    Connection_handler_manager *mgr= Connection_handler_manager::get_instance();
+    Connection_handler_manager *mgr = Connection_handler_manager::get_instance();
     while (!abort_loop)
     {
       // 监听到新的连接请求
-      Channel_info *channel_info= m_listener->listen_for_connection_event();
+      Channel_info *channel_info = m_listener->listen_for_connection_event();
       if (channel_info != NULL)
         // 传入连接管理器处理新连接
         mgr->process_new_connection(channel_info);
@@ -86,6 +88,5 @@ public:
   {
     m_listener->close_listener();
   }
-
 };
 #endif // CONNECTION_ACCEPTOR_INCLUDED

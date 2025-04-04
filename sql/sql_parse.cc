@@ -899,6 +899,9 @@ void cleanup_items(Item *item)
     1  request of thread shutdown (see dispatch_command() description)
 */
 
+/**
+ * 负责处理客户端发送的命令
+ */
 bool do_command(THD *thd)
 {
   bool return_value;
@@ -915,6 +918,8 @@ bool do_command(THD *thd)
   /*
     indicator of uninitialized lex => normal flow of errors handling
     (see my_message_sql)
+    
+    确保当前的SQL解析上下文被重置，避免前一个命令的状态影响当前命令的执行
   */
   thd->lex->set_current_select(0);
 
@@ -934,6 +939,9 @@ bool do_command(THD *thd)
       will be interrupted when the next command is received from
       the client, the connection is closed or "net_wait_timeout"
       number of seconds has passed.
+      
+      如果使用经典协议，设置网络读取超时时间，防止客户端长时间不发送命令
+      导致服务器资源浪费
     */
     net= thd->get_protocol_classic()->get_net();
     my_net_set_read_timeout(net, thd->variables.net_wait_timeout);
@@ -953,6 +961,9 @@ bool do_command(THD *thd)
     kill. In this case it consumes a condition broadcast, but does
     not change anything else. The consumed broadcast should not
     matter here, because the read/recv() below doesn't use it.
+    
+    提供一个同步点，用于模拟慢速代码执行或测试特定场景，
+    方便开发者调试和验证某些边界条件
   */
   DEBUG_SYNC(thd, "before_do_command_net_read");
 
@@ -966,6 +977,9 @@ bool do_command(THD *thd)
     when reading a new network packet.
     In particular, a new instrumented statement is started.
     See init_net_server_extension()
+
+    调用协议层的 get_command 方法，从客户端读取命令和相关数据。
+    thd->m_server_idle 标记服务器是否处于空闲状态，用于性能监控。
   */
   thd->m_server_idle= true;
   // 从指定协议，读取命令及命令数据
@@ -973,6 +987,9 @@ bool do_command(THD *thd)
   rc= thd->get_protocol()->get_command(&com_data, &command);
   thd->m_server_idle= false;
 
+  /**
+   * 错误处理
+   */
   if (rc)
   {
     if (classic)
@@ -1031,11 +1048,16 @@ bool do_command(THD *thd)
   if (classic)
     my_net_set_read_timeout(net, thd->variables.net_read_timeout);
 
-  // 分发执行不同类型的命令
+  /**
+   * 分发执行不同类型的命令
+   */
   return_value= dispatch_command(thd, &com_data, command);
   thd->get_protocol_classic()->get_packet()->shrink(
       thd->variables.net_buffer_length);
 
+/**
+ * 资源清理
+ */
 out:
   /* The statement instrumentation must be closed in all cases. */
   assert(thd->m_digest == NULL);
@@ -1240,7 +1262,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
   /* Performance Schema Interface instrumentation, begin */
   thd->m_statement_psi= MYSQL_REFINE_STATEMENT(thd->m_statement_psi,
                                                com_statement_info[command].m_key);
-
+  /* 设置命令类型 */
   thd->set_command(command);
   /*
     Commands which always take a long time are logged into
@@ -1249,6 +1271,9 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
   thd->enable_slow_log= TRUE;
   thd->lex->sql_command= SQLCOM_END; /* to avoid confusing VIEW detectors */
   thd->set_time();
+  /**
+   * 验证时间是否有效
+   */
   if (thd->is_valid_time() == false)
   {
     /*
@@ -1323,6 +1348,8 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     COM_PING only discloses information that the server is running,
        and that's available through other means.
     COM_QUIT should work even for expired statements.
+
+    密码过期验证
   */
   if (unlikely(thd->security_context()->password_expired() &&
                command != COM_QUERY &&
@@ -1334,7 +1361,9 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     my_error(ER_MUST_CHANGE_PASSWORD, MYF(0));
     goto done;
   }
-
+/**
+ * 审计通知
+ */
 #ifndef EMBEDDED_LIBRARY
   if (mysql_audit_notify(thd,
                          AUDIT_EVENT(MYSQL_AUDIT_COMMAND_START),
@@ -1345,6 +1374,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
 #endif /* !EMBEDDED_LIBRARY */
 
   switch (command) {
+  /* 切换数据库 */ 
   case COM_INIT_DB:
   {
     LEX_STRING tmp;
@@ -1352,10 +1382,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     thd->convert_string(&tmp, system_charset_info,
                         com_data->com_init_db.db_name,
                         com_data->com_init_db.length, thd->charset());
-
+    /* 目标数据库名称 */
     LEX_CSTRING tmp_cstr= {tmp.str, tmp.length};
     if (!mysql_change_db(thd, tmp_cstr, FALSE))
     {
+      /* 调用数据库切换函数成功，记录日志，向客户端发送成功响应 */
       query_logger.general_log_write(thd, command,
                                      thd->db().str, thd->db().length);
       my_ok(thd);
@@ -1463,36 +1494,48 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
   }
   case COM_QUERY:
   {
+    /* m_digest用于存储摘要对象的指针，表示当前查询的规范化形式 */
     assert(thd->m_digest == NULL);
     thd->m_digest= & thd->m_digest_state;
     thd->m_digest->reset(thd->m_token_array, max_digest_length);
-
+    
+    /* 为当前查询分配内存并将查询字符串存储到线程上下文中 */
     if (alloc_query(thd, com_data->com_query.query,
                     com_data->com_query.length))
       break;					// fatal error is set
+    
+    /* 宏，记录了查询的开始事件，将相关信息传递给底层的监控或追踪系统 */
     MYSQL_QUERY_START(const_cast<char*>(thd->query().str), thd->thread_id(),
                       (char *) (thd->db().str ? thd->db().str : ""),
                       (char *) thd->security_context()->priv_user().str,
                       (char *) thd->security_context()->host_or_ip().str);
 
+    /* 计算当前查询字符串的结束位置，并将其存储在packet_end指针中 */
     const char *packet_end= thd->query().str + thd->query().length;
-
+    
+    /**
+     * 如果启用了opt_general_log_raw 选项，
+     * 这行代码会将当前查询记录到通用查询日志（General Query Log）中。
+     */
     if (opt_general_log_raw)
       query_logger.general_log_write(thd, command, thd->query().str,
                                      thd->query().length);
-
+    
+    /* 输出query调试信息 */
     DBUG_PRINT("query",("%-.4096s", thd->query().str));
 
 #if defined(ENABLED_PROFILING)
     thd->profiling.set_query_source(thd->query().str, thd->query().length);
 #endif
-
+    
+    /* 初始化解析器 */
     Parser_state parser_state;
     if (parser_state.init(thd, thd->query().str, thd->query().length))
       break;
-
+    /* 控制交给解析函数 */
     mysql_parse(thd, &parser_state);
 
+    /* 处理多语句查询的执行逻辑，确保每条语句都能正确解析执行 */
     while (!thd->killed && (parser_state.m_lip.found_semicolon != NULL) &&
            ! thd->is_error())
     {
@@ -1577,6 +1620,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     }
 
     /* Need to set error to true for graceful shutdown */
+    /* 确保服务关闭时能够优雅终止线程 */
     if((thd->lex->sql_command == SQLCOM_SHUTDOWN) && (thd->get_stmt_da()->is_ok()))
       error= TRUE;
 
@@ -5434,7 +5478,9 @@ void mysql_init_multi_delete(LEX *lex)
   @param[out]  found_semicolon For multi queries, position of the character of
                                the next query in the query text.
 */
-
+/**
+ * 解析器，解析命令
+ */
 void mysql_parse(THD *thd, Parser_state *parser_state)
 {
   int error MY_ATTRIBUTE((unused));
@@ -5459,9 +5505,12 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
     is required for the cache to work properly.
     FIXME: cleanup the dependencies in the code to simplify this.
   */
+  /* 将线程上下文重置为执行下一个命令状态 */
   mysql_reset_thd_for_next_command(thd);
+  /* 初始化词法分析器 */
   lex_start(thd);
 
+  /* 保存解析器状态，触发预解析插件 */
   thd->m_parser_state= parser_state;
   invoke_pre_parse_rewrite_plugins(thd);
   thd->m_parser_state= NULL;
@@ -5470,17 +5519,25 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
 
   if (query_cache.send_result_to_client(thd, thd->query()) <= 0)
   {
+    /**
+     * 这里是缓存没有命中，前面是初始化变量和错误检查
+     */
     LEX *lex= thd->lex;
     const char *found_semicolon;
 
     bool err= thd->get_stmt_da()->is_error();
 
+    /**
+     * 调用parse_sql函数进行sql语句的解析
+     * 被解析成语法树被保存在thd->lex中
+     */
     if (!err)
     {
       err= parse_sql(thd, parser_state, NULL);
       if (!err)
         err= invoke_post_parse_rewrite_plugins(thd, false);
 
+      /* 标记语句结束的分号位置，用于后续截断查询字符串 */
       found_semicolon= parser_state->m_lip.found_semicolon;
     }
 
@@ -5502,10 +5559,13 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
         If rewriting does not happen here, thd->m_rewritten_query is still
         empty from being reset in alloc_query().
       */
-
+      /**
+       * 重写查询，脱敏、格式化
+       */
       if (thd->rewritten_query().length() == 0)
         mysql_rewrite_query(thd);
 
+      /* 设置重写后的查询显示形式 */
       if (thd->rewritten_query().length())
       {
         lex->safe_to_cache_query= false; // see comments below
@@ -5524,6 +5584,7 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
         thd->set_query_for_display(thd->query().str, thd->query().length);
       }
 
+      /* 记录日志 */
       if (!(opt_general_log_raw || thd->slave_thread))
       {
         if (thd->rewritten_query().length())
@@ -5575,12 +5636,15 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
                            static_cast<size_t>(found_semicolon -
                                                thd->query().str - 1));
           /* Actually execute the query */
+          /* 设置事务状态和执行标记 */
           if (found_semicolon)
           {
             lex->safe_to_cache_query= 0;
             thd->server_status|= SERVER_MORE_RESULTS_EXISTS;
           }
           lex->set_trg_event_type_for_tables();
+          /* 重要：真正开始执行查询 */
+          /* 记录查询执行的开始事件、本身并不执行查询，将信息传递给底层的监控或者追踪系统 */
           MYSQL_QUERY_EXEC_START(
             const_cast<char*>(thd->query().str),
             thd->thread_id(),
@@ -5588,6 +5652,7 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
             (char *) thd->security_context()->priv_user().str,
             (char *) thd->security_context()->host_or_ip().str,
             0);
+          /* 密码过期检查 */
           if (unlikely(thd->security_context()->password_expired() &&
                        !lex->is_set_password_sql &&
                        lex->sql_command != SQLCOM_SET_OPTION &&
@@ -5597,6 +5662,7 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
             error= 1;
           }
           else
+            /* 实际执行查询 */
             error= mysql_execute_command(thd, true);
 
           MYSQL_QUERY_EXEC_DONE(error);
@@ -5653,6 +5719,8 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
       we'd still use for the matching) when we first execute the
       query, and then use the obfuscated query-string for logging
       here when the query is given again.
+
+      缓存命中
     */
     if (!opt_general_log_raw)
       query_logger.general_log_write(thd, COM_QUERY, thd->query().str,
